@@ -1,0 +1,686 @@
+Create a simulated time coordination system using Redis as the coordination backend.
+Design this solution natively for Redis data structures. Workers have dynamic task
+schedules. All workers must be present before the simulation starts (enforced by a
+ready gate). If any worker or the controller crashes, the simulation errors out and
+must be restarted fresh from setup_redis.py. No catchup, no restart recovery.
+Use a Python virtual environment.
+
+## Design Philosophy
+- Redis data structures chosen for fitness, not to mimic a database
+- The sorted set IS the schedule — controller never scans worker hashes to find
+  who is next or when
+- The pending ACK set IS the synchronization gate — checking completion is always
+  a single O(1) SCARD call
+- Redis Streams are the coordination bus — workers sleep on XREAD BLOCK with
+  zero CPU usage while waiting
+- Lua scripts handle all critical sections atomically on the server
+- Worker hashes exist for human inspection only — no coordination logic reads them
+- Fail fast — any crash errors out loudly, full reset is the recovery procedure
+- Workers connect using "$" as stream start ID — they only see messages from the
+  moment they join, which is safe because the ready gate guarantees all workers
+  are present before any messages are sent
+
+## File Structure
+- setup_redis.py       # Initializes all Redis structures, clears previous state
+- controller.py        # Ready gate, clock owner, ACK gate manager
+- worker.py            # Registers, waits for start, executes tasks, ACKs
+- config.py            # All constants and Redis key names
+- scripts/
+    ack.lua            # Atomic ACK: remove from pending, return remaining count
+    advance_clock.lua  # Atomic clock advance: update time, rebuild ACK set,
+                       # write to stream, return due worker count
+- requirements.txt
+- setup.sh
+- setup.bat
+- .gitignore
+- README.md
+
+## Environment Setup
+
+### requirements.txt
+redis>=5.0
+python-dateutil>=2.8
+
+### setup.sh
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+echo "Setup complete. Run 'source venv/bin/activate' to activate."
+
+### setup.bat
+python -m venv venv
+venv\Scripts\activate
+pip install --upgrade pip
+pip install -r requirements.txt
+echo Setup complete. Run 'venv\Scripts\activate' to activate.
+
+### .gitignore
+venv/
+__pycache__/
+*.pyc
+
+## Redis Key Design
+
+### Strings
+  sim:clock:time          ISO datetime — current simulation time
+  sim:clock:status        INIT | WAITING_FOR_WORKERS | RUNNING | DONE
+
+### Sorted Set
+  sim:schedule
+    member: worker_id
+    score:  next_event_time as Unix timestamp (float)
+
+  This is the single source of truth for when each worker next acts.
+    ZRANGEBYSCORE sim:schedule 0 <now_ts>   -> all due workers, one call
+    ZRANGE sim:schedule 0 0 WITHSCORES      -> next upcoming event, one call
+    ZADD sim:schedule <ts> <worker_id>      -> worker updates own schedule
+  The controller never reads worker hashes to determine who is due or what
+  time to advance to.
+
+### Set (ACK gate)
+  sim:pending_acks
+    members: worker_ids due this cycle that have not yet ACK'd
+    SADD sim:pending_acks <ids>   -> controller populates each cycle
+    SREM sim:pending_acks <id>    -> worker removes itself on ACK (via Lua)
+    SCARD sim:pending_acks        -> 0 means all done, advance clock
+
+### Set (worker registry)
+  sim:workers:registered
+    members: worker_ids from config.WORKERS
+    Populated by setup_redis.py, read-only during simulation
+
+### Set (ready gate)
+  sim:workers:ready
+    members: worker_ids that have checked in on startup
+    Workers SADD themselves on startup
+    Controller uses SDIFF sim:workers:registered sim:workers:ready
+    to determine who has not yet checked in
+
+### Stream (coordination bus)
+  sim:events
+    Fields per message:
+      type       SIMULATION_START | CLOCK_ADVANCE | SIMULATION_DONE
+      sim_time   current simulation time (ISO string)
+    Workers use XREAD BLOCK POLL_INTERVAL_MS on this stream.
+    Workers connect with "$" as start ID — safe because ready gate
+    guarantees all workers are online before any messages are published.
+    No WORKER_ACK, WORKER_JOINED, or WORKER_ERROR events needed —
+    those were only required for restart detection.
+
+### Per-worker Metadata Hash (inspection only)
+  sim:worker:<worker_id>
+    status        WAITING | WORKING | ACK | DONE | ERROR
+    last_seen     real UTC ISO timestamp
+    last_ack_time sim_time of last completed task
+  next_event_time is NOT stored here — it lives in sim:schedule only.
+  missed_events field removed — no catchup tracking needed.
+
+## config.py
+  from datetime import datetime, timezone
+
+  REDIS_HOST = "localhost"
+  REDIS_PORT = 6379
+  REDIS_DB   = 0
+  REDIS_PASSWORD = None
+
+  SIM_START = datetime(2026, 1, 1, tzinfo=timezone.utc)
+  SIM_END   = datetime(2026, 3, 31, tzinfo=timezone.utc)
+
+  POLL_INTERVAL_MS       = 1000   # XREAD BLOCK timeout in milliseconds
+  WORKER_TIMEOUT_SECONDS = 30     # stall warning threshold
+  READY_TIMEOUT_SECONDS  = 120    # how long controller waits for all workers
+
+  WORKERS = ["worker_a", "worker_b", "worker_c"]
+
+  # Redis key constants — never hardcode keys outside this file
+  KEY_CLOCK_TIME         = "sim:clock:time"
+  KEY_CLOCK_STATUS       = "sim:clock:status"
+  KEY_SCHEDULE           = "sim:schedule"
+  KEY_PENDING_ACKS       = "sim:pending_acks"
+  KEY_WORKERS_REGISTERED = "sim:workers:registered"
+  KEY_WORKERS_READY      = "sim:workers:ready"
+  KEY_EVENTS_STREAM      = "sim:events"
+  KEY_WORKER_META        = "sim:worker:"   # append worker_id
+
+  LUA_SCRIPT_DIR = "scripts/"
+
+## Lua Scripts
+
+### scripts/ack.lua
+Atomically removes worker from pending_acks and returns remaining count.
+
+KEYS[1] = sim:pending_acks
+KEYS[2] = sim:events
+ARGV[1] = worker_id
+ARGV[2] = sim_time ISO string
+
+local removed = redis.call('SREM', KEYS[1], ARGV[1])
+if removed == 0 then
+  return redis.error_reply('Worker not in pending_acks: ' .. ARGV[1])
+end
+return redis.call('SCARD', KEYS[1])
+-- Returns remaining count. 0 means all workers ACKd this cycle.
+-- No stream write here — controller drives all stream writes.
+
+### scripts/advance_clock.lua
+Atomically advances clock, finds due workers, rebuilds ACK set,
+writes to stream. Called by controller only.
+
+KEYS[1] = sim:clock:time
+KEYS[2] = sim:clock:status
+KEYS[3] = sim:schedule
+KEYS[4] = sim:pending_acks
+KEYS[5] = sim:events
+
+ARGV[1] = new_sim_time ISO string
+ARGV[2] = new_sim_time Unix timestamp (float string)
+ARGV[3] = sim_end Unix timestamp (float string)
+ARGV[4] = event_type  ("SIMULATION_START" or "CLOCK_ADVANCE")
+
+-- Advance clock
+redis.call('SET', KEYS[1], ARGV[1])
+
+-- Check if simulation is over
+if tonumber(ARGV[2]) >= tonumber(ARGV[3]) then
+  redis.call('SET', KEYS[2], 'DONE')
+  redis.call('XADD', KEYS[5], '*',
+    'type', 'SIMULATION_DONE',
+    'sim_time', ARGV[1])
+  return 'DONE'
+end
+
+-- Find all workers due at or before new sim_time
+local due = redis.call('ZRANGEBYSCORE', KEYS[3], 0, ARGV[2])
+
+-- Rebuild pending_acks for this cycle
+redis.call('DEL', KEYS[4])
+if #due > 0 then
+  redis.call('SADD', KEYS[4], unpack(due))
+end
+
+-- Write event to stream
+redis.call('XADD', KEYS[5], '*',
+  'type', ARGV[4],
+  'sim_time', ARGV[1])
+
+return #due
+-- Returns number of workers due this cycle.
+-- 0 means no one due at this time — controller must advance again.
+
+## setup_redis.py
+  1. Connect to Redis, PING to verify, print clear error and exit if unreachable
+  2. Scan and delete ALL keys matching "sim:*" using SCAN + DEL
+     (never use KEYS * — use SCAN with MATCH "sim:*" and COUNT 100)
+  3. Initialize:
+       SET  sim:clock:time    SIM_START.isoformat()
+       SET  sim:clock:status  INIT
+       SADD sim:workers:registered  <all workers from config.WORKERS>
+  4. Do NOT pre-populate sim:schedule — workers register themselves on startup
+     with their own initial next_event_time
+  5. Print all sim:* keys and values to confirm clean state
+  6. Print instructions:
+       "Redis initialized. Start controller.py, then start all workers
+        within READY_TIMEOUT_SECONDS seconds."
+
+## controller.py
+
+### Lua Script Loading
+  Load Lua scripts at startup using r.register_script() for each .lua file.
+  Store as module-level constants: ACK_SCRIPT, ADVANCE_CLOCK_SCRIPT.
+  Never send raw Lua inline.
+
+### Fail Fast Helper
+  def fatal(message):
+      print(f"[CONTROLLER] FATAL: {message}")
+      print("[CONTROLLER] Run setup_redis.py to reset and start over.")
+      sys.exit(1)
+
+  Call fatal() on any unrecoverable condition:
+  - Redis connection lost
+  - Worker in ERROR status detected
+  - READY_TIMEOUT exceeded with zero workers ready
+  - sim:clock:status is unexpected value on startup
+  - Skip-forward loop exceeds maximum iterations
+
+### Startup: Ready Gate
+  1. Verify sim:clock:status == INIT, call fatal() if not
+     (prevents starting controller twice against same Redis state)
+  2. SET sim:clock:status WAITING_FOR_WORKERS
+  3. Print "[CONTROLLER] Waiting for workers. Timeout: 
+     READY_TIMEOUT_SECONDS seconds."
+  4. Poll loop using XREAD BLOCK POLL_INTERVAL_MS on sim:events
+     (no messages yet, so this just provides a timed wait)
+     Actually: use a time.sleep(1) loop here since no stream messages
+     exist yet — XREAD BLOCK on empty stream with "$" returns immediately.
+     Instead poll with:
+       while elapsed < READY_TIMEOUT_SECONDS:
+         missing = r.sdiff(KEY_WORKERS_REGISTERED, KEY_WORKERS_READY)
+         if not missing: break
+         if elapsed % 5 == 0:
+           print(f"[CONTROLLER] Waiting for: {missing}")
+         time.sleep(1)
+         elapsed += 1
+  5. After loop:
+       missing = r.sdiff(KEY_WORKERS_REGISTERED, KEY_WORKERS_READY)
+       if missing == all workers: call fatal("No workers checked in.")
+       if missing (partial): call fatal(f"Workers never checked in: {missing}
+         All workers must be present. Run setup_redis.py and restart.")
+       (no partial starts — either all workers are present or it is fatal)
+  6. SET sim:clock:status RUNNING
+  7. Register all workers into sim:schedule at SIM_START:
+       for worker_id in config.WORKERS:
+         r.zadd(KEY_SCHEDULE, {worker_id: SIM_START.timestamp()})
+     Note: this is done by the controller after confirming all workers
+     are ready, not by workers themselves. This ensures the schedule
+     is consistent from the first cycle.
+  8. Call advance_clock.lua with:
+       new_sim_time = SIM_START
+       event_type   = "SIMULATION_START"
+     This atomically sets clock to SIM_START, finds all due workers
+     (all of them, since all start at SIM_START), populates pending_acks,
+     and publishes SIMULATION_START to the stream.
+  9. Print "[CONTROLLER] All workers ready. Simulation starting. 
+     <N> workers due in first cycle."
+
+### Main Loop
+  1. msgs = XREAD BLOCK POLL_INTERVAL_MS STREAMS sim:events <last_stream_id>
+  2. If no messages (timeout): check for stalled workers (see Stall Detection)
+     and continue
+  3. For each message (process in order):
+       Update last_stream_id to this message ID
+       If type == SIMULATION_DONE:
+         Print final summary (all worker last_ack_times from hashes)
+         Exit cleanly
+       If type == CLOCK_ADVANCE or SIMULATION_START:
+         (controller sent this itself — no action needed, just tracking)
+         continue
+  4. On each loop iteration regardless of messages:
+       remaining = r.scard(KEY_PENDING_ACKS)
+       If remaining == 0:
+         Find next clock time:
+           result = r.zrange(KEY_SCHEDULE, 0, 0, withscores=True)
+           If empty: call fatal("Schedule is empty but sim not done.")
+           next_worker, next_ts = result[0]
+           next_time = datetime.fromtimestamp(next_ts, tz=timezone.utc)
+         Call advance_clock.lua with next_time and "CLOCK_ADVANCE"
+         If result == "DONE": (loop will catch SIMULATION_DONE message)
+           continue
+         If result == 0: (no workers due at this time, skip forward)
+           enter skip-forward loop (see below)
+         Else:
+           Print "[CONTROLLER] Sim time -> <next_time> 
+                  (<result> workers due)"
+  5. Repeat
+
+  Note on ordering: check SCARD on every loop iteration, not just when
+  a WORKER_ACK message arrives. Workers communicate ACKs via ack.lua
+  modifying the set directly — the stream is just for clock signals to
+  workers. This means the controller discovers all-ACK by polling SCARD,
+  which is a single O(1) call and perfectly efficient.
+
+### Skip-Forward Loop
+  When advance_clock.lua returns 0 (no workers due at the new time):
+    max_skips = 10000
+    skips = 0
+    while True:
+      result = r.zrange(KEY_SCHEDULE, 0, 0, withscores=True)
+      if not result: call fatal("Schedule empty during skip-forward.")
+      next_worker, next_ts = result[0]
+      next_time = datetime.fromtimestamp(next_ts, tz=timezone.utc)
+      result = advance_clock.lua(next_time, "CLOCK_ADVANCE")
+      if result == "DONE": break
+      if result > 0: break    (found workers due)
+      skips += 1
+      if skips > max_skips: call fatal("Skip-forward limit exceeded.")
+
+### Stall Detection
+  Track time of last clock advance (last_advance_real_time = time.time()).
+  On each loop timeout (no messages for POLL_INTERVAL_MS):
+    if time.time() - last_advance_real_time > WORKER_TIMEOUT_SECONDS:
+      pending = r.smembers(KEY_PENDING_ACKS)
+      for worker_id in pending:
+        status = r.hget(f"{KEY_WORKER_META}{worker_id}", "status")
+        if status == "ERROR":
+          call fatal(f"Worker {worker_id} is in ERROR state.")
+        print(f"[CONTROLLER] WARNING: {worker_id} stalled 
+               (status={status})")
+
+## worker.py
+Accepts worker_id as CLI argument: python worker.py worker_a
+
+### Fail Fast Helper
+  def fatal(worker_id, message):
+      print(f"[{worker_id}] FATAL: {message}")
+      print(f"[{worker_id}] Run setup_redis.py to reset and start over.")
+      sys.exit(1)
+
+### Startup Sequence
+  1. Validate worker_id is in config.WORKERS, exit with clear error if not
+  2. Connect to Redis, PING, call fatal() if unreachable
+  3. Load Lua scripts: ACK_SCRIPT
+  4. Verify sim:clock:status is INIT or WAITING_FOR_WORKERS
+     If RUNNING or DONE: call fatal("Simulation already started.
+       All workers must be present before simulation begins.
+       Run setup_redis.py and restart.")
+  5. Register:
+       SADD sim:workers:ready <worker_id>
+       HSET sim:worker:<worker_id> status READY last_seen <utcnow>
+  6. Print "[worker_id] Registered. Waiting for all workers and 
+     simulation start..."
+  7. Subscribe to stream with last_stream_id = "$"
+     (only see messages from this point forward — safe because
+      ready gate guarantees simulation has not started yet)
+  8. Poll until sim:clock:status == RUNNING:
+       while True:
+         status = r.get(KEY_CLOCK_STATUS)
+         if status == "RUNNING": break
+         if status == "DONE": 
+           call fatal("Simulation ended before this worker started.")
+         time.sleep(1)
+  9. Print "[worker_id] Simulation started. Entering task loop."
+
+### Main Task Loop
+  Driven entirely by stream messages. No polling of sim:clock:time directly.
+
+  1. msgs = XREAD COUNT 10 BLOCK POLL_INTERVAL_MS
+             STREAMS sim:events <last_stream_id>
+  2. If timeout (no messages):
+       Update last_seen: HSET sim:worker:<id> last_seen <utcnow>
+       Continue
+  3. For each message:
+       Update last_stream_id to this message ID
+       If type == SIMULATION_DONE:
+         HSET sim:worker:<id> status DONE
+         Print "[worker_id] Simulation complete. 
+                Last task: <last_ack_time>"
+         Exit cleanly
+       If type == SIMULATION_START or CLOCK_ADVANCE:
+         sim_time = parse message sim_time field as datetime (UTC)
+         Check if due:
+           my_next_ts = r.zscore(KEY_SCHEDULE, worker_id)
+           If my_next_ts is None:
+             call fatal("Worker not found in schedule.")
+           If sim_time.timestamp() >= my_next_ts:
+             If SISMEMBER sim:pending_acks worker_id is False:
+               call fatal("Due but not in pending_acks — state mismatch.")
+             Execute task (see Task Execution below)
+           Else:
+             Update last_seen, continue waiting
+  4. Repeat
+
+### Task Execution
+  1. HSET sim:worker:<id> status WORKING  last_seen <utcnow>
+  2. hours = get_next_event_hours(worker_id, sim_time)
+  3. new_next_time = sim_time + timedelta(hours=hours)
+  4. If new_next_time > SIM_END:
+       ZREM KEY_SCHEDULE worker_id
+       HSET sim:worker:<id> status DONE  last_ack_time <sim_time>
+       ACK_SCRIPT(keys=[KEY_PENDING_ACKS], args=[worker_id, sim_time.isoformat()])
+       Print "[worker_id] Final task at <sim_time>. 
+              No more events before SIM_END."
+       (do not exit — keep reading stream until SIMULATION_DONE)
+  5. Else:
+       new_next_ts = new_next_time.timestamp()
+       ZADD KEY_SCHEDULE new_next_ts worker_id
+       HSET sim:worker:<id> status ACK  last_ack_time <sim_time>
+       remaining = ACK_SCRIPT(
+         keys=[KEY_PENDING_ACKS],
+         args=[worker_id, sim_time.isoformat()])
+       Print "[worker_id] ACK at <sim_time>, next at <new_next_time>
+              (<hours> sim hours, <remaining> others pending)"
+
+### Error Handling
+  Wrap entire main loop in try/except:
+  On any unhandled exception:
+    HSET sim:worker:<id> status ERROR
+    Print full traceback
+    Print "[worker_id] Worker failed. Run setup_redis.py to reset."
+    Exit with code 1
+
+## get_next_event_hours(worker_id, sim_time)
+
+PRIMARY CUSTOMIZATION POINT.
+
+Signature:
+  def get_next_event_hours(worker_id: str, sim_time: datetime) -> int
+
+Contract:
+  - Return a positive integer: sim hours until this worker's next task
+  - No is_catchup parameter — there is no catchup in this design
+  - May read from Redis or any other source
+  - Branch on worker_id for per-worker behavior
+
+Default implementation:
+  hours = random.choice([1, 2, 4, 8, 12, 24, 48])
+  sleep(random.uniform(1, 3))   # simulate variable real work duration
+  print(f"[{worker_id}] Task at {sim_time}: next in {hours} sim hours")
+  return hours
+
+Add comment block:
+  - This is the ONLY function that changes for real business logic
+  - No catchup guard needed — workers only ever run live tasks
+  - Branch on worker_id for completely different behavior per worker
+  - Can read from Redis, files, APIs, or databases
+
+## Redis Inspection Commands (add to README.md)
+
+  # Simulation state
+  redis-cli GET sim:clock:time
+  redis-cli GET sim:clock:status
+
+  # Schedule: who acts next (scores are Unix timestamps)
+  redis-cli ZRANGE sim:schedule 0 -1 WITHSCORES
+
+  # Who still needs to ACK this cycle
+  redis-cli SMEMBERS sim:pending_acks
+
+  # Ready gate status
+  redis-cli SMEMBERS sim:workers:registered
+  redis-cli SMEMBERS sim:workers:ready
+
+  # Worker metadata
+  redis-cli HGETALL sim:worker:worker_a
+
+  # Event stream (most recent 20)
+  redis-cli XREVRANGE sim:events + - COUNT 20
+
+  # Watch live events
+  redis-cli XREAD BLOCK 0 STREAMS sim:events $
+
+  # Count events so far
+  redis-cli XLEN sim:events
+
+## Validation Comment Block (bottom of controller.py)
+
+Trace through two complete cycles showing exact Redis state.
+
+Step 0 — setup_redis.py:
+  GET  sim:clock:time              -> "2026-01-01T00:00:00+00:00"
+  GET  sim:clock:status            -> "INIT"
+  SMEMBERS sim:workers:registered  -> {"worker_a", "worker_b", "worker_c"}
+  ZRANGE   sim:schedule 0 -1       -> (empty)
+  XLEN     sim:events              -> 0
+
+Step 1 — Controller starts ready gate:
+  SET sim:clock:status "WAITING_FOR_WORKERS"
+  worker_a: SADD sim:workers:ready worker_a
+            HSET sim:worker:worker_a status READY last_seen <now>
+  worker_b: SADD sim:workers:ready worker_b
+  worker_c: SADD sim:workers:ready worker_c
+  SDIFF sim:workers:registered sim:workers:ready -> (empty, all present)
+  SET sim:clock:status "RUNNING"
+  ZADD sim:schedule 1735689600 worker_a   (SIM_START ts)
+  ZADD sim:schedule 1735689600 worker_b
+  ZADD sim:schedule 1735689600 worker_c
+  advance_clock.lua(SIM_START, "SIMULATION_START"):
+    SET  sim:clock:time "2026-01-01T00:00:00+00:00"
+    ZRANGEBYSCORE sim:schedule 0 1735689600 -> [worker_a, worker_b, worker_c]
+    DEL  sim:pending_acks
+    SADD sim:pending_acks worker_a worker_b worker_c
+    XADD sim:events * type SIMULATION_START sim_time "2026-01-01T00:00:00+00:00"
+    returns 3
+
+Step 2 — Workers process SIMULATION_START (sim_time = 2026-01-01T00:00:00):
+  All three workers read SIMULATION_START from stream
+  Each checks: ZSCORE sim:schedule <id> -> 1735689600 == sim_time ts -> due
+  Each checks: SISMEMBER sim:pending_acks <id> -> 1 -> confirmed due
+
+  worker_a: get_next_event_hours -> 8
+    ZADD sim:schedule 1735718400 worker_a   (SIM_START + 8h)
+    HSET sim:worker:worker_a status ACK  last_ack_time "2026-01-01T00:00:00+00:00"
+    ack.lua: SREM sim:pending_acks worker_a -> SCARD returns 2
+
+  worker_b: get_next_event_hours -> 24
+    ZADD sim:schedule 1735776000 worker_b   (SIM_START + 24h)
+    ack.lua: SREM sim:pending_acks worker_b -> SCARD returns 1
+
+  worker_c: get_next_event_hours -> 12
+    ZADD sim:schedule 1735732800 worker_c   (SIM_START + 12h)
+    ack.lua: SREM sim:pending_acks worker_c -> SCARD returns 0
+
+  SCARD sim:pending_acks -> 0
+
+  ZRANGE sim:schedule 0 -1 WITHSCORES ->
+    worker_a: 1735718400   (2026-01-01T08:00:00)  <- minimum, next clock target
+    worker_c: 1735732800   (2026-01-01T12:00:00)
+    worker_b: 1735776000   (2026-01-02T00:00:00)
+
+Step 3 — Controller advances clock to 08:00:
+  ZRANGE sim:schedule 0 0 WITHSCORES -> [(worker_a, 1735718400)]
+  advance_clock.lua("2026-01-01T08:00:00", 1735718400, "CLOCK_ADVANCE"):
+    SET  sim:clock:time "2026-01-01T08:00:00+00:00"
+    ZRANGEBYSCORE sim:schedule 0 1735718400 -> [worker_a]
+    DEL  sim:pending_acks
+    SADD sim:pending_acks worker_a
+    XADD sim:events * type CLOCK_ADVANCE sim_time "2026-01-01T08:00:00+00:00"
+    returns 1
+
+  SMEMBERS sim:pending_acks -> {worker_a}
+
+Step 4 — Only worker_a is due at 08:00:
+  worker_a reads CLOCK_ADVANCE, sim_time = 08:00
+    ZSCORE sim:schedule worker_a -> 1735718400 == sim_time ts -> due
+    get_next_event_hours -> 4
+    ZADD sim:schedule 1735732800 worker_a   (08:00 + 4h = 12:00)
+
+    Note: worker_c is already at 1735732800 (12:00)
+    Both worker_a and worker_c are now scheduled at 12:00 — this is valid,
+    the sorted set handles multiple members with the same score correctly.
+
+    ack.lua: SREM sim:pending_acks worker_a -> SCARD returns 0
+
+  worker_b reads CLOCK_ADVANCE, sim_time = 08:00
+    ZSCORE sim:schedule worker_b -> 1735776000 (Jan 2) > 08:00 ts -> not due
+    Updates last_seen, continues waiting
+
+  worker_c reads CLOCK_ADVANCE, sim_time = 08:00
+    ZSCORE sim:schedule worker_c -> 1735732800 (12:00) > 08:00 ts -> not due
+    Updates last_seen, continues waiting
+
+  SCARD sim:pending_acks -> 0
+
+  ZRANGE sim:schedule 0 0 WITHSCORES ->
+    (worker_a, 1735732800) or (worker_c, 1735732800)  <- tied at 12:00, either valid
+  advance_clock.lua("2026-01-01T12:00:00", ...):
+    ZRANGEBYSCORE sim:schedule 0 1735732800 -> [worker_a, worker_c]
+    SADD sim:pending_acks worker_a worker_c
+    returns 2
+
+  Both worker_a and worker_c are now due at 12:00. Cycle repeats.
+
+Show exact Redis key/value state after each step.
+
+## README.md — Full Contents
+
+### Prerequisites
+  - Python 3.9 or higher
+  - Redis 6.2 or higher
+
+### Installing Redis
+  Mac:     brew install redis && brew services start redis
+  Ubuntu:  sudo apt install redis-server && sudo systemctl start redis
+  Windows: docker run -d -p 6379:6379 redis:latest
+
+### Verify Redis is running
+  redis-cli ping   -> should return PONG
+
+### Setup (run once per simulation)
+  Unix/Mac:
+    bash setup.sh
+    source venv/bin/activate
+
+  Windows:
+    setup.bat
+    venv\Scripts\activate
+
+### Running the Simulation
+
+  Step 1 — Initialize Redis (required before every run):
+    python setup_redis.py
+
+  Step 2 — Start the controller:
+    source venv/bin/activate
+    python controller.py
+    The controller waits up to READY_TIMEOUT_SECONDS for all workers.
+    Do not let this timeout expire — start all workers promptly.
+
+  Step 3 — Start all workers within the timeout window:
+    Terminal 2: source venv/bin/activate && python worker.py worker_a
+    Terminal 3: source venv/bin/activate && python worker.py worker_b
+    Terminal 4: source venv/bin/activate && python worker.py worker_c
+
+    ALL workers must be running before READY_TIMEOUT_SECONDS elapses.
+    The controller will not start until every registered worker checks in.
+
+### Operational Rules
+  - Always run setup_redis.py before starting a new simulation
+  - Always start all workers before the ready timeout expires
+  - If any process crashes, the simulation is over — run setup_redis.py
+    and restart everything from scratch
+  - Do not restart a crashed worker and expect it to rejoin — it will
+    be rejected because the simulation is already RUNNING
+
+### If Something Goes Wrong
+  Any crash or error means the simulation state is invalid.
+  Recovery is always:
+    1. python setup_redis.py
+    2. Restart controller and all workers
+
+### Live Inspection
+  redis-cli GET sim:clock:time
+  redis-cli GET sim:clock:status
+  redis-cli ZRANGE sim:schedule 0 -1 WITHSCORES
+  redis-cli SMEMBERS sim:pending_acks
+  redis-cli SMEMBERS sim:workers:ready
+  redis-cli HGETALL sim:worker:worker_a
+  redis-cli XREVRANGE sim:events + - COUNT 20
+  redis-cli XREAD BLOCK 0 STREAMS sim:events $
+  redis-cli XLEN sim:events
+
+### Adding a New Worker
+  1. Add the worker ID to config.WORKERS
+  2. Run setup_redis.py (resets the simulation)
+  3. Start: python worker.py <new_worker_id>
+
+### Customizing Task Logic
+  Edit get_next_event_hours() in worker.py.
+  Return a positive integer: sim hours until next task.
+  Branch on worker_id for per-worker behavior.
+  No catchup flag — this function is only ever called for live tasks.
+
+### Resetting the Simulation
+  python setup_redis.py
+  Clears all sim:* keys and returns to a clean INIT state.
+
+### Architecture Summary
+  sim:schedule      Sorted set — the schedule. Scores are Unix timestamps.
+                    Controller reads this to know when to advance the clock.
+                    Workers write to this after each task.
+  sim:pending_acks  Set — the ACK gate. Populated by controller each cycle.
+                    Workers remove themselves via ack.lua when done.
+                    SCARD == 0 triggers clock advance.
+  sim:events        Stream — coordination bus. Controller writes clock
+                    advances. Workers block on XREAD waiting for signals.
+
+  sim:worker:<id>   Hash — human inspection only. Not used for coordination.

@@ -9,7 +9,6 @@ guarantees all workers are online before any messages are sent.
 """
 
 import os
-import random
 import sys
 import time
 import traceback
@@ -38,25 +37,6 @@ def fatal(worker_id: str, message: str):
     print(f"[{worker_id}] FATAL: {message}")
     print(f"[{worker_id}] Run setup_redis.py to reset and start over.")
     sys.exit(1)
-
-
-# ---------------------------------------------------------------------------
-# Task logic — PRIMARY CUSTOMIZATION POINT
-# ---------------------------------------------------------------------------
-
-def get_next_event_hours(worker_id: str, sim_time: datetime) -> int:
-    """
-    Return a positive integer: sim hours until this worker's next task.
-
-    This is the ONLY function that changes for real business logic.
-    No catchup guard needed — workers only ever run live tasks.
-    Branch on worker_id for completely different behavior per worker.
-    Can read from Redis, files, APIs, or databases.
-    """
-    hours = random.choice([1, 2, 4, 8, 12, 24, 48])
-    time.sleep(random.uniform(1, 3))   # simulate variable real work duration
-    print(f"[{worker_id}] Task at {sim_time.isoformat()}: next in {hours} sim hours")
-    return hours
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +198,7 @@ def _execute_task(r, worker_id: str, ACK_SCRIPT, sim_time: datetime):
     r.hset(f"{config.KEY_WORKER_META}{worker_id}",
            mapping={"status": "WORKING", "last_seen": now_utc})
 
-    hours = get_next_event_hours(worker_id, sim_time)
+    hours = config.WORKER_TASKS[worker_id](worker_id, sim_time)
     new_next_time = sim_time + timedelta(hours=hours)
 
     if new_next_time > config.SIM_END:

@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
 
+from tasks.random_test import run as random_test
+
 REDIS_HOST = "localhost"
 REDIS_PORT = 6379
 REDIS_DB   = 0
@@ -25,3 +27,9 @@ KEY_EVENTS_STREAM      = "sim:events"
 KEY_WORKER_META        = "sim:worker:"   # append worker_id
 
 LUA_SCRIPT_DIR = "scripts/"
+
+WORKER_TASKS = {
+    "worker_a": random_test,
+    "worker_b": random_test,
+    "worker_c": random_test,
+}

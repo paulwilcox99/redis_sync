@@ -32,23 +32,36 @@ venv\Scripts\activate
 ### 2. Initialize Redis
 
 ```bash
-python setup_redis.py
+venv/bin/python3 setup_redis.py
 ```
 
 ### 3. Start the System (4 terminals)
 
+Each process must run with the venv Python interpreter.
+
 ```bash
 # Terminal 1
-python controller.py
+venv/bin/python3 controller.py
 
 # Terminal 2
-python worker.py worker_a
+venv/bin/python3 worker.py worker_a
 
 # Terminal 3
-python worker.py worker_b
+venv/bin/python3 worker.py worker_b
 
 # Terminal 4
-python worker.py worker_c
+venv/bin/python3 worker.py worker_c
+```
+
+Alternatively, activate the venv first and use `python3` directly:
+
+```bash
+source venv/bin/activate   # Linux/macOS
+# or: venv\Scripts\activate  (Windows)
+
+python3 controller.py
+python3 worker.py worker_a
+# etc.
 ```
 
 Workers must all start within `READY_TIMEOUT_SECONDS` (default: 120s).
@@ -56,7 +69,7 @@ Workers must all start within `READY_TIMEOUT_SECONDS` (default: 120s).
 ### 4. Reset After Crash
 
 ```bash
-python setup_redis.py
+venv/bin/python3 setup_redis.py
 ```
 
 Then restart controller and all workers. No partial recovery — always restart fresh.
@@ -65,10 +78,12 @@ Then restart controller and all workers. No partial recovery — always restart 
 
 ```
 redis_sync/
-├── config.py           # All constants and Redis key names
+├── config.py           # Simulation settings, worker list, WORKER_TASKS mapping
 ├── setup_redis.py      # Initializes all Redis structures, clears previous state
 ├── controller.py       # Ready gate, clock owner, ACK gate manager
 ├── worker.py           # Registers, waits for start, executes tasks, ACKs
+├── tasks/
+│   └── random_test.py  # Example task: returns a random sim-hour interval
 ├── scripts/
 │   ├── ack.lua         # Atomic ACK: remove from pending, return remaining count
 │   └── advance_clock.lua  # Atomic clock advance: update time, rebuild ACK set,
@@ -79,18 +94,7 @@ redis_sync/
 └── .gitignore
 ```
 
-## Customization
-
-The only function you need to change for real business logic is
-`get_next_event_hours(worker_id, sim_time)` in `worker.py`.
-
-```python
-def get_next_event_hours(worker_id: str, sim_time: datetime) -> int:
-    # Return sim hours until this worker's next task.
-    # Branch on worker_id for per-worker behavior.
-    # Can read from Redis, files, APIs, or databases.
-    pass
-```
+See `DEVELOPER_GUIDE.md` for how to create new tasks and configure worker models.
 
 ## Redis Inspection Commands
 

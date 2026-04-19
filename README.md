@@ -35,7 +35,16 @@ venv\Scripts\activate
 venv/bin/python3 setup_redis.py
 ```
 
-### 3. Start the System (4 terminals)
+### 3. Start the System
+
+**Single terminal (recommended):**
+```bash
+bash run.sh
+```
+
+This runs setup, starts the controller and all workers, and streams their output to the terminal. Press Ctrl+C to stop everything cleanly.
+
+**Multiple terminals (alternative):**
 
 Each process must run with the venv Python interpreter.
 

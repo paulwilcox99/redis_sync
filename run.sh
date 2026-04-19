@@ -2,6 +2,16 @@
 set -e
 
 PYTHON=venv/bin/python3
+PIDS=""
+
+cleanup() {
+    echo ""
+    echo "Stopping simulation..."
+    kill $PIDS 2>/dev/null
+    wait $PIDS 2>/dev/null
+    exit 0
+}
+trap cleanup INT TERM
 
 $PYTHON setup_redis.py
 

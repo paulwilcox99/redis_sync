@@ -157,7 +157,7 @@ redis-cli XLEN sim:events
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `SIM_START` | 2026-01-01 UTC | Simulation start datetime |
-| `SIM_END` | 2026-03-31 UTC | Simulation end datetime |
+| `SIM_END` | 2026-01-11 UTC | Simulation end datetime |
 | `POLL_INTERVAL_MS` | 1000 | XREAD BLOCK timeout |
 | `WORKER_TIMEOUT_SECONDS` | 30 | Stall warning threshold |
 | `READY_TIMEOUT_SECONDS` | 120 | How long controller waits for all workers |

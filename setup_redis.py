@@ -71,7 +71,11 @@ def main():
         else:
             print(f"  {key} ({key_type})")
 
-    # 6. Instructions
+    # 6. Run model init if defined
+    if hasattr(config, 'SIM_INIT') and config.SIM_INIT:
+        config.SIM_INIT(config.WORKERS)
+
+    # 7. Instructions
     print(f"""
 [SETUP] Redis initialized. Start controller.py, then start all workers
         within {config.READY_TIMEOUT_SECONDS} seconds.

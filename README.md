@@ -87,11 +87,13 @@ Then restart controller and all workers. No partial recovery — always restart 
 
 ```
 redis_sync/
-├── config.py           # Simulation settings, worker list, WORKER_TASKS mapping
-├── setup_redis.py      # Initializes all Redis structures, clears previous state
+├── config.py           # Simulation settings, worker list, SIM_INIT, WORKER_TASKS
+├── setup_redis.py      # Initializes Redis structures, runs SIM_INIT, clears previous state
 ├── controller.py       # Ready gate, clock owner, ACK gate manager
 ├── worker.py           # Registers, waits for start, executes tasks, ACKs
+├── run.sh              # Single-command launcher for controller and all workers
 ├── tasks/
+│   ├── init_model.py   # Example model init function
 │   └── random_test.py  # Example task: returns a random sim-hour interval
 ├── scripts/
 │   ├── ack.lua         # Atomic ACK: remove from pending, return remaining count
@@ -158,3 +160,5 @@ redis-cli XLEN sim:events
 | `WORKER_TIMEOUT_SECONDS` | 30 | Stall warning threshold |
 | `READY_TIMEOUT_SECONDS` | 120 | How long controller waits for all workers |
 | `WORKERS` | `["worker_a", "worker_b", "worker_c"]` | Worker IDs |
+| `SIM_INIT` | — | Optional init function called by setup_redis.py before simulation starts |
+| `WORKER_TASKS` | — | Dict mapping each worker ID to its task function |

@@ -9,8 +9,8 @@ A **task** is a Python function that executes one unit of work for a worker at a
 A **model** is the set of workers defined in `config.py` and the task function assigned to each one.
 
 The coordination framework (`controller.py`, `worker.py`, Lua scripts) never changes. All customization lives in two places:
-- `tasks/` — one file per task type
-- `config.py` — worker list and task assignments
+- `tasks/` — one file per task type, plus an optional model init file
+- `config.py` — worker list, init function, and task assignments
 
 ---
 
@@ -104,6 +104,44 @@ The worker fires at hour N (start), stores state, returns 4. It fires again at h
 
 ---
 
+## Model Initialization
+
+If your model needs to set up shared resources before the simulation starts (databases, files, shared state), define an init function in `tasks/` and assign it to `SIM_INIT` in `config.py`. It is called once by `setup_redis.py` before any workers or the controller start.
+
+### Init function contract
+
+```python
+def run(workers: list):
+    # workers is the list of worker IDs from config.WORKERS
+    # set up anything the model needs here
+```
+
+The `workers` argument lets the init function set up only what the active workers need — useful when different models use different subsets of resources.
+
+### Example
+
+```python
+# tasks/init_my_model.py
+import sqlite3
+
+def run(workers: list):
+    conn = sqlite3.connect("sim_data.db")
+    conn.execute("CREATE TABLE IF NOT EXISTS events (worker TEXT, sim_time TEXT, value INTEGER)")
+    conn.commit()
+    conn.close()
+    print(f"[INIT] Database ready for workers: {workers}")
+```
+
+```python
+# config.py
+from tasks.init_my_model import run as sim_init
+SIM_INIT = sim_init
+```
+
+`SIM_INIT` is optional — if not defined in `config.py`, `setup_redis.py` skips the init step.
+
+---
+
 ## Configuring a Model
 
 A model is defined entirely in `config.py`. To create a new model:
@@ -123,7 +161,16 @@ SIM_START = datetime(2026, 1, 1, tzinfo=timezone.utc)
 SIM_END   = datetime(2026, 3, 31, tzinfo=timezone.utc)
 ```
 
-### 3. Import task functions and assign them
+### 3. Import and assign the init function
+
+```python
+from tasks.init_my_model import run as sim_init
+SIM_INIT = sim_init
+```
+
+This is optional. If omitted, no init step runs.
+
+### 4. Import task functions and assign them
 
 ```python
 from tasks.my_task import run as my_task
@@ -139,10 +186,16 @@ WORKER_TASKS = {
 
 Every worker ID in `WORKERS` must appear in `WORKER_TASKS`. Multiple workers can share the same task function — `worker_id` is passed in so the function can branch on it if needed.
 
-### 4. Run setup and start
+### 5. Run setup and start
 
 ```bash
-venv/bin/python3 setup_redis.py
+bash run.sh
+```
+
+Or manually:
+
+```bash
+venv/bin/python3 setup_redis.py      # runs SIM_INIT then initializes Redis
 venv/bin/python3 controller.py       # terminal 1
 venv/bin/python3 worker.py worker_a  # terminal 2
 venv/bin/python3 worker.py worker_b  # terminal 3
@@ -187,9 +240,20 @@ Task functions may read any `sim:` key for observability or decision-making. Wri
 
 ---
 
-## Example: `tasks/random_test.py`
+## Examples
 
-The bundled `random_test` task is the simplest valid task. It picks a random interval, sleeps briefly to simulate real work, and returns:
+### `tasks/init_model.py`
+
+The bundled init example prints the worker list and exits. Use it to verify init is wired up correctly before adding real setup logic.
+
+```python
+def run(workers: list):
+    print(f"[INIT] Initializing model with workers: {workers}")
+```
+
+### `tasks/random_test.py`
+
+The bundled task picks a random interval, sleeps briefly to simulate real work, and returns. Use it to verify the full simulation loop before adding real task logic.
 
 ```python
 import random
@@ -203,5 +267,3 @@ def run(worker_id: str, sim_time: datetime) -> int:
     print(f"[{worker_id}] Task at {sim_time.isoformat()}: next in {hours} sim hours")
     return hours
 ```
-
-Use this to verify the framework is working before adding real logic.

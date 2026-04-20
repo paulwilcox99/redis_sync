@@ -92,9 +92,11 @@ redis_sync/
 ├── controller.py       # Ready gate, clock owner, ACK gate manager
 ├── worker.py           # Registers, waits for start, executes tasks, ACKs
 ├── run.sh              # Single-command launcher for controller and all workers
+├── crontab             # Cron job definitions (used by the cron worker)
 ├── tasks/
 │   ├── init_model.py   # Example model init function
-│   └── random_test.py  # Example task: returns a random sim-hour interval
+│   ├── random_test.py  # Example task: returns a random sim-hour interval
+│   └── cron.py         # Cron worker: executes crontab entries at simulated time
 ├── scripts/
 │   ├── ack.lua         # Atomic ACK: remove from pending, return remaining count
 │   └── advance_clock.lua  # Atomic clock advance: update time, rebuild ACK set,

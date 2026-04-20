@@ -1,0 +1,9 @@
+# Simulation crontab
+# Fields: minute  hour  day-of-month  month  day-of-week  command
+# Note: minute field is parsed but ignored (sim clock runs at whole-hour granularity)
+
+# Daily report at 9 AM sim time
+0 9 * * *    venv/bin/python3 test.py daily-report
+
+# Every 12 sim-hours
+0 */12 * * * venv/bin/python3 test.py 12h-heartbeat

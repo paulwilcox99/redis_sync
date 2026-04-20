@@ -240,6 +240,50 @@ Task functions may read any `sim:` key for observability or decision-making. Wri
 
 ---
 
+## Cron Worker
+
+The bundled `tasks/cron.py` provides a cron-style scheduler that fires jobs based on simulated time rather than wall-clock time. It reads a standard crontab file and executes matching entries as fire-and-forget subprocesses each time the worker is called.
+
+### Crontab file
+
+Place a file named `crontab` in the project root. Standard 5-field syntax:
+
+```
+# Fields: minute  hour  day-of-month  month  day-of-week  command
+0 9 * * *    venv/bin/python3 my_script.py arg1
+0 */12 * * * venv/bin/python3 another_script.py
+```
+
+Supported field syntax: `*`, `n`, `*/n`, `n-m`, `n,m,o`, `n-m/s`.
+
+**Minute field:** parsed but ignored — the sim clock advances in whole hours, so all jobs fire on hour boundaries regardless of the minute value. Keep this field as a placeholder for future sub-hour support.
+
+For multiple cron workers, name the file `crontab.<worker_id>` (e.g. `crontab.cron_a`). The worker looks for its specific file first and falls back to `crontab`.
+
+### How it schedules
+
+On each firing the worker:
+1. Checks every crontab entry against the current `sim_time`
+2. Launches all matching commands via `subprocess.Popen` (fire-and-forget — jobs run independently and do not block the sim tick)
+3. Finds the earliest next firing time across all entries and returns that many sim-hours
+
+When no future jobs remain within `SIM_END`, the worker schedules itself past the end of the simulation and goes dormant.
+
+### Wiring it up in `config.py`
+
+```python
+from tasks.cron import run as cron_task
+
+WORKERS = [..., "cron"]
+
+WORKER_TASKS = {
+    ...,
+    "cron": cron_task,
+}
+```
+
+---
+
 ## Examples
 
 ### `tasks/init_model.py`
@@ -250,6 +294,10 @@ The bundled init example prints the worker list and exits. Use it to verify init
 def run(workers: list):
     print(f"[INIT] Initializing model with workers: {workers}")
 ```
+
+### `tasks/cron.py`
+
+The bundled cron worker reads `crontab` from the project root, executes matching entries as subprocesses at the correct simulated time, and returns the hours to the next scheduled job. See the [Cron Worker](#cron-worker) section above for full details.
 
 ### `tasks/random_test.py`
 
